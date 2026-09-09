@@ -1,0 +1,26 @@
+{
+  "name": "@webgrip/de-vloer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hosted operator workbench for remote agent crews",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/main.ts",
+    "demo": "node --env-file-if-exists=.env src/main.ts --demo",
+    "test": "node --test test/*.test.ts",
+    "check": "node scripts/check.mjs",
+    "user:add": "node scripts/user-add.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:browser": "node scripts/browser-check.mjs"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "playwright": "1.62.1",
+    "typescript": "7.0.2"
+  }
+}

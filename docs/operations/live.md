@@ -1,0 +1,104 @@
+# Live operation
+
+Live mode runs paid or otherwise metered agent work. The intended first deployment is a private workbench on a remote server, then one configured Kubernetes environment. A browser on a laptop controls that deployment; the agent processes and repository checks run where the server/workspace backend runs.
+
+Read [validation](../validation.md) for the actual qualification level. The local fixture demonstration does not validate these external integrations.
+
+## First real OpenCode session
+
+Prepare Node 24, Git and OpenCode `1.18.30`, the version pinned in the agent image. Register a repository the execution environment can clone. For the first qualification use a disposable public test repository; private forge credential provisioning is a separate deployment concern and must not inherit an operator's workstation login.
+
+Prepare a LiteLLM proxy with virtual-key management enabled and a working model alias such as `coding`. The gateway must support the model's required tool calls. De Vloer uses the inference URL and a separately configurable management URL. Confirm model access and spend tracking in the gateway before supervising a paid session. The [LiteLLM virtual-key guide](https://docs.litellm.ai/docs/proxy/virtual_keys) documents the gateway prerequisites.
+
+Copy the supplied non-secret configuration and set the repository URL, branch and verification argv:
+
+```sh
+cp config/live.example.json config/live.local.json
+```
+
+The minimal runtime selection is:
+
+```json
+{
+  "kind": "opencode",
+  "backend": "local",
+  "binary": "opencode",
+  "timeoutMs": 1200000
+}
+```
+
+This is the `runtime` object, not a full configuration file. `local` means local to the **De Vloer server**. A remote server with this backend already moves agent CPU, memory and repository checks off the operator's laptop. Use this backend only for trusted single-user development on a dedicated host. It separates working directories and selected environment variables, but runs under the control server’s OS user. Approved shell commands or repository scripts can access server files, process environments and sibling workspaces. This is not a boundary for protecting the master key against hostile code. Use the Kubernetes backend with the supplied separate namespace and pod restrictions for a shared team pilot.
+
+Supply secrets through the deployment environment, or a private ignored `.env` for a single trusted server. `npm start` loads `.env` if present. Never put real credentials in checked-in JSON.
+
+| Setting | Purpose |
+| --- | --- |
+| `VLOER_CONFIG` or `--config` | Configuration file path |
+| `VLOER_ADMIN_NAME` | Initial administrator name; defaults to `admin` |
+| `VLOER_ADMIN_PASSWORD` | Initial administrator password, at least 12 characters; creates the account only if absent |
+| `VLOER_DATA_DIR` | Persistent state/workspace directory; defaults to `.vloer` |
+| `VLOER_HOST`, `VLOER_PORT` | Bind address and port; default `127.0.0.1:4080` |
+| `VLOER_BASE_URL` | Public HTTP(S) URL used for origin and secure-cookie behavior |
+| `LITELLM_BASE_URL` | Agent inference endpoint, normally the gateway URL including `/v1` |
+| `LITELLM_ADMIN_URL` | Management API root; defaults to inference URL with trailing `/v1` removed |
+| `LITELLM_MASTER_KEY` | Gateway management credential held by the control plane |
+
+Then start and sign in:
+
+```sh
+npm start -- --config config/live.local.json
+```
+
+Select the registered repository and delivery crew, authorize a small budget and start one session. Inspect actual tool activity, changes, verification output and the explicit review verdict. Exercise a human permission response when one occurs. Reload the browser to verify continuity. At completion verify the final spend state and gateway key revocation; `unknown` is a blocker to investigate, not zero cost. The default 60-second settlement delay is a configurable grace period for gateway reporting, not a guarantee that delayed upstream charges can never arrive. Qualify it against the gateway’s spend update interval; budget enforcement has the gateway’s concurrency and in-flight request limits.
+
+The workspace manager starts an authenticated OpenCode server per managed workspace and injects a session-scoped LiteLLM inference key. Do **not** set `OPENCODE_URL` for this managed path. Although configuration can describe an external endpoint, v0.1 rejects giving a managed session credential to a shared pre-existing OpenCode server. Use local provisioning on the remote host or Kubernetes provisioning.
+
+For another operator, run `npm run user:add` against the same `VLOER_DATA_DIR` while the server is stopped, then restart it. The helper asks for a name and role and generates a password shown once unless `VLOER_USER_PASSWORD` is supplied through the environment. Keep that output private. This is local account provisioning; SSO and shared session membership are not implemented.
+
+## Kubernetes
+
+Deployment assets live under `ops/helm/de-vloer`; the application Dockerfile and `ops/agent/Dockerfile` build separate control-plane and agent images. Build and publish them to an authorized registry, then configure explicit image tags or digests in values. The supplied configuration is an example, not the user's actual cluster inventory.
+
+Validate manifests before installation:
+
+```sh
+helm lint ops/helm/de-vloer
+helm template de-vloer ops/helm/de-vloer > /tmp/de-vloer-rendered.yaml
+```
+
+The chart defaults to **demo** mode. Copy `ops/helm/de-vloer/values.live.example.yaml` to a private `values.live.local.yaml` and replace its example registry, forge, gateway/model and network selectors. Configure `credentialsSecret` in the application namespace with the environment variables listed above. Keep the master key out of the workspace namespace. Configure `workspaceGitSecretName` only when a dedicated repository read credential has been provisioned there.
+
+Use **one application replica** with persistent storage and the chart's `Recreate` rollout strategy. Configure a separate workspace namespace, storage class/size, CPU/memory requests, an agent image and an inference gateway URL reachable by agent Pods. The control plane needs the chart's narrowly scoped workspace-management RBAC. Agent Pods must not mount the control-plane service account or LiteLLM master credential.
+
+Review the live render with the deployment's own values:
+
+```sh
+helm lint ops/helm/de-vloer -f values.live.local.yaml
+helm template de-vloer ops/helm/de-vloer --namespace de-vloer -f values.live.local.yaml > /tmp/de-vloer-live.yaml
+```
+
+After the images, namespace policy, persistent storage and application Secret are prepared, an authorized operator can install the reviewed configuration:
+
+```sh
+helm upgrade --install de-vloer ops/helm/de-vloer --namespace de-vloer --create-namespace -f values.live.local.yaml
+```
+
+The manager provisions real Kubernetes resources through the API. It retains workspace PVCs after runtime disposal so changes and native state can survive; volume retention has an operational cost. Cleanup policy must preserve reviewable work before deleting retained volumes. Configure `workspaceEgress` for the actual forge and inference gateway; example selectors are not universal access rules. Kubernetes network isolation depends on the cluster's network-policy implementation, so chart rendering cannot prove enforcement.
+
+Before a team rollout, qualify Pod startup/readiness, repository cloning, model requests, interruption, permission handling, restart recovery, spend settlement and resource cleanup on the target cluster. Record the tested image digests, Kubernetes version, gateway version and result in [validation](../validation.md). No automated chart command deploys this application.
+
+## Another harness through the command bridge
+
+Set `runtime.kind` to `command`, `backend` to `local`, and `command` to an administrator-controlled argv array such as `["/opt/company-agent/runner"]`. This process runs in the session checkout on the De Vloer server. It is not executed through a shell, and operators cannot supply arbitrary executable paths through the session form.
+
+The bridge sends a versioned `start` JSON line on stdin, forwards human responses, and expects normalized event lines plus one terminal result and exit code zero. Cancellation sends a cancel line before process termination. The exact protocol and exercised adapter evidence are in [agent API research](../research/agent-apis.md). An OpenHands SDK wrapper can implement this seam; the existence of the seam does not mean every harness or SDK version has been tested.
+
+## Routine intervention and recovery
+
+- To steer a running role, pause, record the instruction and explicitly resume. Preserve the original objective history and authorization.
+- If a reviewer requests changes or gives no conclusive approval, inspect the findings and decide the next task. There is no automatic unlimited review loop.
+- If the server restarts, active sessions become interrupted. Inspect retained changes, resolve uncertain spend and explicitly resume. Do not create a replacement session to bypass accounting.
+- To add budget, an administrator authorizes a positive increment within the total configured limit. Active spending may need to be paused and reconciled first.
+- Back up SQLite consistently using a SQLite-aware snapshot or by stopping the single server before copying the database and associated files. Preserve retained workspace/PVC evidence separately and test restore before relying on it.
+
+Subscription authentication is not provided by this managed path. If a harness later supports an upstream-approved personal subscription flow, it still needs separate visible identity/quota semantics; it does not become a pool of LiteLLM API credit. Use API-backed gateway credentials for the currently implemented managed model budget.

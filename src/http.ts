@@ -1,0 +1,206 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { AppConfig, User, RuntimeKind, Session } from './types.ts';
+import { Auth } from './auth.ts';
+import type { Engine } from './engine.ts';
+import { publicSession, type Store } from './store.ts';
+
+function fault(status: number, code: string, message: string): never { throw Object.assign(new Error(message), { status, code }); }
+
+function json(res: ServerResponse, status: number, value: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(value));
+}
+
+async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
+  if (!req.headers['content-type']?.startsWith('application/json')) fault(415, 'content_type', 'Use application/json.');
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 131072) fault(413, 'body_too_large', 'Request is too large.');
+    chunks.push(chunk);
+  }
+  try {
+    const data = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error();
+    return data;
+  } catch { return fault(400, 'invalid_json', 'Expected a JSON object.'); }
+}
+
+function text(value: unknown, name: string, max: number, optional = false): string {
+  if (optional && (value === undefined || value === '')) return '';
+  if (typeof value !== 'string' || !value.trim() || value.length > max) fault(400, 'invalid_input', `${name} must be text between 1 and ${max} characters.`);
+  return (value as string).trim();
+}
+
+function mutationGuard(req: IncomingMessage, config: AppConfig): void {
+  if (req.headers['x-vloer-request'] !== '1') fault(403, 'csrf', 'The request is missing the application request header.');
+  const origin = req.headers.origin;
+  if (origin) {
+    let expected: string;
+    try { expected = new URL(config.baseUrl || `http://${req.headers.host}`).origin; }
+    catch { return fault(403, 'origin', 'Invalid request origin.'); }
+    if (origin !== expected) fault(403, 'origin', 'This request came from another origin.');
+  }
+  if (req.headers['sec-fetch-site'] === 'cross-site') fault(403, 'origin', 'Cross-site requests are not allowed.');
+}
+
+export function buildServer(config: AppConfig, store: Store, engine: Engine, runtimeKinds: RuntimeKind[]) {
+  const auth = new Auth(store, config);
+  const streams = new Set<ServerResponse>();
+  const knownSecrets = [config.litellm?.masterKey, config.runtime.password, config.auth.bootstrapPassword].filter((value): value is string => Boolean(value && value.length > 5));
+  function sanitize<T>(value: T): T {
+    let encoded = JSON.stringify(value);
+    for (const secret of knownSecrets) encoded = encoded.split(JSON.stringify(secret).slice(1, -1)).join('[redacted]');
+    return JSON.parse(encoded);
+  }
+  function visible(id: string, user: User): Session {
+    const session = store.getSession(id);
+    if (!session || (session.ownerId !== user.id && user.role !== 'admin')) fault(404, 'not_found', 'Session not found.');
+    return session as Session;
+  }
+  const server = createServer(async (req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    try {
+      const url = new URL(req.url || '/', 'http://localhost');
+      const path = url.pathname;
+      const method = req.method || 'GET';
+      if (path === '/healthz' || path === '/readyz') {
+        if (method !== 'GET') return json(res, 405, { error: { code: 'method', message: 'GET required.' } });
+        store.listSessions();
+        return json(res, 200, { status: 'ok', version: '0.1.0' });
+      }
+      if (['POST','PUT','PATCH','DELETE'].includes(method)) mutationGuard(req, config);
+      if (method === 'POST' && path === '/api/login') {
+        const data = await body(req);
+        const result = auth.login(text(data.name, 'Name', 100), typeof data.password === 'string' ? data.password : '', req.socket.remoteAddress || 'unknown');
+        res.setHeader('Set-Cookie', result.cookie);
+        return json(res, 200, { user: result.user });
+      }
+      if (method === 'POST' && path === '/api/logout') {
+        res.setHeader('Set-Cookie', auth.logout(req));
+        return json(res, 200, { ok: true });
+      }
+      if (path.startsWith('/api/')) {
+        const user = auth.user(req);
+        if (!user) return json(res, 401, { error: { code: 'unauthenticated', message: 'Sign in to your workbench.' } });
+        if (method === 'GET' && path === '/api/bootstrap') return json(res, 200, sanitize({
+          user, mode: config.mode,
+          repositories: config.repositories.map(({ id, name, description, baseBranch, trackerUrl }) => ({ id, name, description, baseBranch, trackerUrl })),
+          crews: config.crews, models: config.models,
+          runtimes: runtimeKinds.map(id => ({ id, name: id === 'demo' ? 'Demonstration' : id === 'opencode' ? 'OpenCode' : 'Command bridge', available: true })),
+          maxBudgetUsd: config.maxBudgetUsd, maxConcurrentSessions: config.maxConcurrentSessions
+        }));
+        if (method === 'GET' && path === '/api/health') return json(res, 200, { status: 'ok', mode: config.mode, version: '0.1.0', runtimes: runtimeKinds, litellm: Boolean(config.litellm), workspaceBackend: config.mode === 'demo' ? 'demo' : config.runtime.backend });
+        if (method === 'GET' && path === '/api/sessions') return json(res, 200, sanitize(store.listSessions().filter(session => session.ownerId === user.id || user.role === 'admin').map(publicSession)));
+        if (method === 'POST' && path === '/api/sessions') {
+          if (user.role === 'viewer') fault(403, 'forbidden', 'Viewers cannot start work.');
+          const data = await body(req);
+          const runtime = text(data.runtime, 'Runtime', 32) as RuntimeKind;
+          const repositoryId = text(data.repositoryId, 'Repository', 64);
+          const crewId = text(data.crewId, 'Crew', 64);
+          if (!runtimeKinds.includes(runtime) || !config.repositories.some(repo => repo.id === repositoryId) || !config.crews.some(crew => crew.id === crewId)) fault(400, 'unknown_profile', 'Choose a configured repository, crew and runtime.');
+          if (typeof data.budgetUsd !== 'number' || !Number.isFinite(data.budgetUsd) || data.budgetUsd <= 0 || data.budgetUsd > config.maxBudgetUsd) fault(400, 'budget', `Budget must be greater than zero and at most $${config.maxBudgetUsd}.`);
+          const trackerUrl = text(data.trackerUrl, 'Tracker link', 2048, true);
+          if (trackerUrl) {
+            let parsed: URL;
+            try { parsed = new URL(trackerUrl); } catch { return fault(400, 'tracker_url', 'Use an HTTP(S) tracker link.'); }
+            if (!['http:','https:'].includes(parsed.protocol) || parsed.username || parsed.password) fault(400, 'tracker_url', 'Use an HTTP(S) tracker link without credentials.');
+          }
+          const session = engine.create({ title: text(data.title, 'Title', 160), objective: text(data.objective, 'Objective', 16000), repositoryId, crewId, runtime, budgetUsd: data.budgetUsd as number, trackerUrl: trackerUrl || undefined }, user);
+          return json(res, 201, sanitize(publicSession(session)));
+        }
+        if (method === 'GET' && path === '/api/ploeg') {
+          if (!config.ploeg) return json(res, 200, { configured: false, teams: [], message: 'Connect Ploeg in the server configuration to inspect its queues.' });
+          const teams = await Promise.all(config.ploeg.teams.map(async team => {
+            try {
+              const response = await fetch(`${config.ploeg!.url}/api/v1/queue/depth?team=${encodeURIComponent(team)}`, { signal: AbortSignal.timeout(4000), redirect: 'error' });
+              if (!response.ok) throw new Error();
+              const data = await response.json() as Record<string, unknown>;
+              const depth = Number(data.depth ?? data.queued ?? data.count);
+              if (!Number.isSafeInteger(depth) || depth < 0) throw new Error();
+              return { team, available: true, depth };
+            } catch { return { team, available: false, message: 'Queue could not be reached.' }; }
+          }));
+          return json(res, 200, { configured: true, teams, trackerUrl: config.ploeg.trackerUrl, message: 'Ploeg retains ownership of unattended dispatch. Assign work in the tracker.' });
+        }
+        const match = path.match(/^\/api\/sessions\/([a-zA-Z0-9_-]+)(?:\/(.*))?$/);
+        if (match) {
+          const [, id, action = ''] = match;
+          const session = visible(id, user);
+          if (method === 'GET' && !action) return json(res, 200, sanitize(publicSession(session)));
+          if (method === 'GET' && action === 'history') {
+            const after = Math.max(0, Math.floor(Number(url.searchParams.get('after')) || 0));
+            return json(res, 200, sanitize(store.events(id, after)));
+          }
+          if (method === 'GET' && action === 'permissions') return json(res, 200, sanitize(store.permissions(id).map(({ nativeId, ...request }) => request)));
+          if (method === 'GET' && action === 'events') {
+            if (streams.size >= 100) fault(429, 'streams', 'Too many live connections.');
+            let cursor = Math.max(0, Math.floor(Number(url.searchParams.get('after') || req.headers['last-event-id']) || 0));
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+            streams.add(res);
+            res.write('retry: 1500\n\n');
+            let heartbeat = 0;
+            const tick = () => {
+              try {
+                if (!auth.user(req)) { res.end(); return; }
+                for (const event of store.events(id, cursor)) {
+                  if (res.writableLength > 1048576) { res.destroy(); return; }
+                  res.write(`id: ${event.id}\ndata: ${JSON.stringify(sanitize(event))}\n\n`);
+                  cursor = event.id;
+                }
+                if (++heartbeat % 30 === 0) res.write(': heartbeat\n\n');
+              } catch { res.end(); }
+            };
+            tick();
+            const timer = setInterval(tick, 500);
+            res.on('close', () => { clearInterval(timer); streams.delete(res); });
+            return;
+          }
+          if (method === 'POST') {
+            if (user.role === 'viewer') fault(403, 'forbidden', 'Viewers cannot change work.');
+            const data = await body(req);
+            let result: Session;
+            if (action === 'start') result = await engine.start(id, user);
+            else if (action === 'pause') result = await engine.pause(id, user);
+            else if (action === 'resume') result = await engine.resume(id, user);
+            else if (action === 'cancel') result = await engine.cancel(id, user);
+            else if (action === 'messages') result = engine.message(id, text(data.text, 'Instruction', 16000), user);
+            else if (action === 'budget') {
+              if (user.role !== 'admin') fault(403, 'forbidden', 'An administrator must authorize additional budget.');
+              if (typeof data.amountUsd !== 'number' || !Number.isFinite(data.amountUsd) || data.amountUsd <= 0) fault(400, 'budget', 'Additional budget must be positive.');
+              result = await engine.addBudget(id, data.amountUsd as number, user);
+            } else if (action.startsWith('permissions/')) {
+              if (data.decision !== undefined && !['once','always','reject'].includes(String(data.decision))) fault(400, 'permission', 'Invalid permission decision.');
+              if (data.answers !== undefined && (!Array.isArray(data.answers) || data.answers.length > 20 || data.answers.some((answers: unknown) => !Array.isArray(answers) || answers.some(value => typeof value !== 'string' || value.length > 4000)))) fault(400, 'answers', 'Invalid question answers.');
+              result = await engine.respond(id, action.slice('permissions/'.length), data as any, user);
+            } else return fault(404, 'not_found', 'Action not found.');
+            return json(res, 200, sanitize(publicSession(result)));
+          }
+        }
+        return fault(404, 'not_found', 'API route not found.');
+      }
+      const assets: Record<string, string> = { '/': 'index.html', '/app.js': 'app.js', '/styles.css': 'styles.css', '/favicon.svg': 'favicon.svg' };
+      if (method !== 'GET' || !assets[path]) return fault(404, 'not_found', 'Page not found.');
+      const file = assets[path];
+      const content = await readFile(join(config.publicDir, file));
+      res.writeHead(200, { 'Content-Type': file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.css') ? 'text/css; charset=utf-8' : file.endsWith('.svg') ? 'image/svg+xml' : 'text/javascript; charset=utf-8', 'Cache-Control': 'no-cache' });
+      res.end(content);
+    } catch (error: any) {
+      if (res.headersSent) { res.end(); return; }
+      const status = Number(error.status || error.statusCode) || 500;
+      const code = error.code || (status === 500 ? 'internal_error' : 'request_failed');
+      const message = status >= 500 ? 'The operation could not be completed. Check the server log.' : error.message;
+      if (status >= 500) console.error(JSON.stringify({ level: 'error', event: 'http.failed', message: String(error.message).slice(0, 200).replace(/sk-[\w-]+/g, '[redacted]') }));
+      json(res, status, sanitize({ error: { code, message } }));
+    }
+  });
+  server.requestTimeout = 15000;
+  server.headersTimeout = 10000;
+  return { server, closeStreams: () => { for (const stream of streams) stream.end(); streams.clear(); } };
+}

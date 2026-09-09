@@ -1,0 +1,15 @@
+[tools]
+node = "24.19.0"
+helm = "4.2.4"
+
+[tasks.demo]
+run = "npm run demo"
+description = "Run the local fixture demo without provider credentials"
+
+[tasks.verify]
+run = ["npm run typecheck", "npm test", "npm run check"]
+description = "Run the local hard gates after npm ci"
+
+[tasks.chart]
+run = ["helm lint ops/helm/de-vloer", "helm template de-vloer ops/helm/de-vloer"]
+description = "Lint and render deployment manifests without a cluster"

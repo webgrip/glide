@@ -1,0 +1,44 @@
+image:
+  repository: registry.example/de-vloer
+  tag: 0.1.0
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+service:
+  port: 4080
+storage:
+  size: 4Gi
+  className: ""
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+mode: demo
+baseUrl: ""
+credentialsSecret: de-vloer-credentials
+workspaceNamespace: de-vloer-workspaces
+createWorkspaceNamespace: true
+workspaceImage: registry.example/de-vloer-agent:1.18.30
+workspaceStorageSize: 8Gi
+workspaceStorageClass: ""
+workspaceCpu: "1"
+workspaceMemory: 2Gi
+workspaceImagePullSecrets: []
+workspaceGitSecretName: ""
+workspaceEgress: []
+config:
+  maxConcurrentSessions: 2
+  maxBudgetUsd: 10
+  models: []
+  repositories: []
+  litellm:
+    ttl: 4h
+    settlementDelayMs: 60000
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  tlsSecret: ""
